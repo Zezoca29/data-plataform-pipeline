@@ -1,0 +1,145 @@
+version: '3.9'
+
+x-common-env: &common-env
+  KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+  KAFKA_TOPIC: crypto_prices_raw
+  MINIO_ROOT_USER: minio
+  MINIO_ROOT_PASSWORD: minio123
+  MINIO_ENDPOINT: http://minio:9000
+  MINIO_BUCKET: lakehouse
+  POSTGRES_USER: warehouse
+  POSTGRES_PASSWORD: warehouse
+  POSTGRES_DB: warehouse
+
+services:
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    depends_on: [zookeeper]
+    ports:
+      - '9092:9092'
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ':9001'
+    ports:
+      - '9000:9000'
+      - '9001:9001'
+    environment:
+      MINIO_ROOT_USER: minio
+      MINIO_ROOT_PASSWORD: minio123
+
+  postgres:
+    image: postgres:15
+    ports:
+      - '5432:5432'
+    environment:
+      POSTGRES_USER: warehouse
+      POSTGRES_PASSWORD: warehouse
+      POSTGRES_DB: warehouse
+    volumes:
+      - ./warehouse/init.sql:/docker-entrypoint-initdb.d/init.sql
+
+  spark-master:
+    image: bitnami/spark:3.5
+    environment:
+      - SPARK_MODE=master
+      - SPARK_MASTER_PORT_NUMBER=7077
+      - SPARK_MASTER_WEBUI_PORT_NUMBER=8080
+    ports:
+      - '8080:8080'
+      - '7077:7077'
+    volumes:
+      - ./spark_jobs:/opt/spark_jobs
+
+  spark-worker:
+    image: bitnami/spark:3.5
+    depends_on: [spark-master]
+    environment:
+      - SPARK_MODE=worker
+      - SPARK_MASTER_URL=spark://spark-master:7077
+
+  ingestion:
+    build:
+      context: .
+      dockerfile: ingestion/Dockerfile
+    depends_on: [kafka]
+    environment:
+      <<: *common-env
+      CRYPTO_SYMBOLS: bitcoin,ethereum,solana
+      QUOTE_CURRENCY: usd
+      POLLING_INTERVAL_SECONDS: 30
+
+  airflow-webserver:
+    build:
+      context: .
+      dockerfile: airflow/Dockerfile
+    command: webserver
+    depends_on: [postgres, kafka, minio]
+    environment:
+      <<: *common-env
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__CORE__FERNET_KEY: ''
+      AIRFLOW__CORE__LOAD_EXAMPLES: 'False'
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://warehouse:warehouse@postgres:5432/warehouse
+      AIRFLOW_CONN_WAREHOUSE_POSTGRES: postgres://warehouse:warehouse@postgres:5432/warehouse
+    ports:
+      - '8088:8080'
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+      - ./ingestion:/opt/airflow/ingestion
+      - ./spark_jobs:/opt/airflow/spark_jobs
+      - ./dbt_project:/opt/airflow/dbt_project
+
+  airflow-scheduler:
+    build:
+      context: .
+      dockerfile: airflow/Dockerfile
+    command: scheduler
+    depends_on: [airflow-webserver]
+    environment:
+      <<: *common-env
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__CORE__FERNET_KEY: ''
+      AIRFLOW__CORE__LOAD_EXAMPLES: 'False'
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://warehouse:warehouse@postgres:5432/warehouse
+      AIRFLOW_CONN_WAREHOUSE_POSTGRES: postgres://warehouse:warehouse@postgres:5432/warehouse
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+      - ./ingestion:/opt/airflow/ingestion
+      - ./spark_jobs:/opt/airflow/spark_jobs
+      - ./dbt_project:/opt/airflow/dbt_project
+
+  dbt:
+    image: ghcr.io/dbt-labs/dbt-postgres:1.8.2
+    depends_on: [postgres]
+    volumes:
+      - ./dbt_project:/usr/app
+    working_dir: /usr/app
+    command: run --profiles-dir .
+
+  superset:
+    image: apache/superset:latest
+    depends_on: [postgres]
+    ports:
+      - '8089:8088'
+    environment:
+      SUPERSET_SECRET_KEY: super-secret-key
+    command: >
+      /bin/sh -c "
+      superset db upgrade &&
+      superset fab create-admin --username admin --firstname Data --lastname Team --email admin@local --password admin &&
+      superset init &&
+      superset run -h 0.0.0.0 -p 8088"
